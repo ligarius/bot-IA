@@ -12,6 +12,7 @@ import pandas as pd
 from .backtester import Backtester
 from .config import CONFIG, configure_logging
 from .data_loader import MarketDataLoader
+from .features import LSTM_FEATURE_COLUMNS
 from .indicators import compute_indicators
 from .lstm_model import LSTMTrainer
 from .rl_agent import RLAgent, TradingEnvironment
@@ -31,21 +32,7 @@ def train_lstm(loader: MarketDataLoader) -> None:
     frame_5m = _load_data(loader, "5m", max(CONFIG.data_points_short, CONFIG.lstm_sequence_length + 100))
     frame_15m = _load_data(loader, "15m", CONFIG.data_points_long)
     indicators = compute_indicators(frame_5m, frame_15m)
-    feature_columns = [
-        "close",
-        "volume",
-        "rsi",
-        "macd",
-        "macd_signal",
-        "macd_hist",
-        "ema_9",
-        "ema_21",
-        "ema_50",
-        "ema_200",
-        "supertrend",
-        "adx",
-    ]
-    features = indicators.frame[feature_columns].dropna()
+    features = indicators.frame[LSTM_FEATURE_COLUMNS].dropna()
     trainer = LSTMTrainer()
     metrics = trainer.train(features)
     LOGGER.info("LSTM training metrics: %s", metrics)
@@ -59,7 +46,17 @@ def train_rl(loader: MarketDataLoader) -> None:
     frame_15m = _load_data(loader, "15m", CONFIG.data_points_long)
     indicators = compute_indicators(frame_5m, frame_15m)
 
+    feature_df = indicators.frame[LSTM_FEATURE_COLUMNS].dropna()
     normalized_df = indicators.normalized.dropna()
+    common_index = normalized_df.index.intersection(feature_df.index)
+    feature_df = feature_df.loc[common_index]
+    normalized_df = normalized_df.loc[common_index]
+
+    if not feature_df.index.equals(normalized_df.index):
+        raise RuntimeError("Feature and normalized data are not aligned for RL training")
+
+    LOGGER.info("RL training dataset aligned with %d samples", len(common_index))
+
     min_required = max(CONFIG.lstm_sequence_length, CONFIG.rl_window + 1)
     if len(normalized_df) <= min_required:
         raise RuntimeError("Insufficient data for RL training")
@@ -70,7 +67,7 @@ def train_rl(loader: MarketDataLoader) -> None:
     lstm_predictions = np.zeros((len(normalized_df), 3))
 
     for idx in range(CONFIG.lstm_sequence_length, len(normalized_df)):
-        window = normalized_df.iloc[idx - CONFIG.lstm_sequence_length : idx]
+        window = feature_df.iloc[idx - CONFIG.lstm_sequence_length : idx]
         prediction = trainer.infer(model, window)
         lstm_predictions[idx] = prediction
 
@@ -93,15 +90,24 @@ def run_backtest(loader: MarketDataLoader) -> None:
     indicators = compute_indicators(frame_5m, frame_15m)
 
     trainer = LSTMTrainer()
+    feature_df = indicators.frame[LSTM_FEATURE_COLUMNS].dropna()
     normalized_df = indicators.normalized.dropna()
+    common_index = normalized_df.index.intersection(feature_df.index)
+    feature_df = feature_df.loc[common_index]
+    normalized_df = normalized_df.loc[common_index]
+
+    if not feature_df.index.equals(normalized_df.index):
+        raise RuntimeError("Feature and normalized data are not aligned for backtesting")
+
     try:
         model = trainer.load_model()
         if len(normalized_df) > CONFIG.lstm_sequence_length:
             lstm_predictions = np.zeros((len(normalized_df), 3))
             for idx in range(CONFIG.lstm_sequence_length, len(normalized_df)):
-                window = normalized_df.iloc[idx - CONFIG.lstm_sequence_length : idx]
+                window = feature_df.iloc[idx - CONFIG.lstm_sequence_length : idx]
                 prediction = trainer.infer(model, window)
                 lstm_predictions[idx] = prediction
+            LOGGER.info("Backtest LSTM predictions aligned for %d samples (last timestamp: %s)", len(normalized_df), normalized_df.index[-1])
         else:
             lstm_predictions = None
     except FileNotFoundError:
@@ -134,12 +140,21 @@ def run_paper_trading(loader: MarketDataLoader) -> None:
     while True:
         frame_5m = loader.stream_live(CONFIG.symbol, CONFIG.interval_live, limit=CONFIG.lstm_sequence_length + 10)
         indicators = compute_indicators(frame_5m, frame_15m)
+        feature_frame = indicators.frame[LSTM_FEATURE_COLUMNS].dropna()
         normalized = indicators.normalized.dropna()
+        common_index = normalized.index.intersection(feature_frame.index)
+        feature_frame = feature_frame.loc[common_index]
+        normalized = normalized.loc[common_index]
+
+        if not feature_frame.index.equals(normalized.index):
+            LOGGER.warning("Feature and normalized data misaligned during paper trading iteration")
+            continue
+
         if len(normalized) < CONFIG.lstm_sequence_length:
             LOGGER.warning("Not enough data for decision making yet")
             continue
 
-        window = normalized.tail(CONFIG.lstm_sequence_length)
+        window = feature_frame.tail(CONFIG.lstm_sequence_length)
         lstm_prediction = trainer.infer(model, window)
 
         latest_time = normalized.index[-1]
@@ -148,6 +163,7 @@ def run_paper_trading(loader: MarketDataLoader) -> None:
         price = frame_5m.tail(1)["close"].iloc[0]
 
         decision = strategy.decide(row, signals, lstm_prediction)
+        LOGGER.debug("Paper trading alignment check | time=%s | feature_shape=%s | normalized_shape=%s", latest_time, window.shape, normalized.shape)
         LOGGER.info("Decision at %s: %s", latest_time, decision.reason)
 
         if decision.action == 1:
@@ -171,12 +187,21 @@ def run_live_trading(loader: MarketDataLoader) -> None:
     while True:
         frame_5m = loader.stream_live(CONFIG.symbol, CONFIG.interval_live, limit=CONFIG.lstm_sequence_length + 10)
         indicators = compute_indicators(frame_5m, frame_15m)
+        feature_frame = indicators.frame[LSTM_FEATURE_COLUMNS].dropna()
         normalized = indicators.normalized.dropna()
+        common_index = normalized.index.intersection(feature_frame.index)
+        feature_frame = feature_frame.loc[common_index]
+        normalized = normalized.loc[common_index]
+
+        if not feature_frame.index.equals(normalized.index):
+            LOGGER.warning("Feature and normalized data misaligned during live trading iteration")
+            continue
+
         if len(normalized) < CONFIG.lstm_sequence_length:
             LOGGER.warning("Not enough data for decision making yet")
             continue
 
-        window = normalized.tail(CONFIG.lstm_sequence_length)
+        window = feature_frame.tail(CONFIG.lstm_sequence_length)
         lstm_prediction = trainer.infer(model, window)
 
         latest_time = normalized.index[-1]
@@ -185,6 +210,12 @@ def run_live_trading(loader: MarketDataLoader) -> None:
         price = frame_5m.tail(1)["close"].iloc[0]
 
         decision = strategy.decide(row, signals, lstm_prediction)
+        LOGGER.debug(
+            "Live trading alignment check | time=%s | feature_shape=%s | normalized_shape=%s",
+            latest_time,
+            window.shape,
+            normalized.shape,
+        )
         LOGGER.info("Live decision at %s: %s", latest_time, decision.reason)
 
         if decision.action == 1:
