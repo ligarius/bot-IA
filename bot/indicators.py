@@ -45,14 +45,26 @@ def _detect_rsi_divergence(frame: pd.DataFrame, lookback: int = 14) -> pd.Series
     for i in range(lookback, len(frame)):
         price_slice = price.iloc[i - lookback : i]
         rsi_slice = rsi.iloc[i - lookback : i]
-        price_high = price_slice.idxmax()
-        price_low = price_slice.idxmin()
-        rsi_high = rsi_slice.idxmax()
-        rsi_low = rsi_slice.idxmin()
 
-        if price_slice.iloc[-1] > price_slice.loc[price_high] and rsi_slice.iloc[-1] < rsi_slice.loc[rsi_high]:
+        price_valid = price_slice.dropna()
+        rsi_valid = rsi_slice.dropna()
+        latest_price = price_slice.iloc[-1]
+        latest_rsi = rsi_slice.iloc[-1]
+
+        if price_valid.empty or rsi_valid.empty:
+            continue
+
+        if pd.isna(latest_price) or pd.isna(latest_rsi):
+            continue
+
+        price_high = price_valid.idxmax()
+        price_low = price_valid.idxmin()
+        rsi_high = rsi_valid.idxmax()
+        rsi_low = rsi_valid.idxmin()
+
+        if latest_price > price_slice.loc[price_high] and latest_rsi < rsi_slice.loc[rsi_high]:
             divergence.iloc[i] = -1  # bearish divergence
-        elif price_slice.iloc[-1] < price_slice.loc[price_low] and rsi_slice.iloc[-1] > rsi_slice.loc[rsi_low]:
+        elif latest_price < price_slice.loc[price_low] and latest_rsi > rsi_slice.loc[rsi_low]:
             divergence.iloc[i] = 1  # bullish divergence
 
     return divergence
