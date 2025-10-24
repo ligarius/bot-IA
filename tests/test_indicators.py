@@ -1,12 +1,18 @@
 import os
 import sys
 
+import inspect
+
 import numpy as np
 import pandas as pd
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from bot.indicators import IndicatorResult, compute_indicators
+from bot.indicators import (
+    IndicatorResult,
+    _detect_rsi_divergence,
+    compute_indicators,
+)
 
 
 def _build_frame(start, periods, freq):
@@ -23,8 +29,12 @@ def _build_frame(start, periods, freq):
 
 
 def test_compute_indicators_handles_nan_rsi():
-    frame_5m = _build_frame("2024-01-01", periods=10, freq="5min")
+    lookback = inspect.signature(_detect_rsi_divergence).parameters["lookback"].default
+
+    frame_5m = _build_frame("2024-01-01", periods=lookback + 6, freq="5min")
     frame_15m = _build_frame("2024-01-01", periods=4, freq="15min")
+
+    frame_5m.loc[frame_5m.index[-(lookback + 1) :], "close"] = np.nan
 
     result = compute_indicators(frame_5m, frame_15m)
 
