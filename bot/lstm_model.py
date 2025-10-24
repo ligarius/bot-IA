@@ -62,12 +62,22 @@ class LSTMTrainer:
         future_close = frame["close"].shift(-1)
         delta = (future_close - frame["close"]) / frame["close"]
         labels = pd.cut(delta, bins=[-np.inf, -0.001, 0.001, np.inf], labels=[0, 1, 2])
-        return labels.astype(int)
+        return labels.cat.codes
 
     def train(self, features: pd.DataFrame) -> dict:
         labels = self._create_labels(features)
         features = features.dropna()
         labels = labels.loc[features.index]
+
+        valid_mask = labels.isin({0, 1, 2})
+        if not valid_mask.all():
+            features = features.loc[valid_mask]
+            labels = labels.loc[valid_mask]
+
+        unique_labels = set(labels.unique())
+        if not unique_labels.issubset({0, 1, 2}):
+            raise ValueError(f"Unexpected labels encountered: {unique_labels}")
+        LOGGER.debug("Unique labels after filtering: %s", sorted(unique_labels))
 
         X, y = self._create_sequences(features, labels, self.config.sequence_length)
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
