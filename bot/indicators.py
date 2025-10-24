@@ -163,7 +163,7 @@ def compute_indicators(frame_5m: pd.DataFrame, frame_15m: pd.DataFrame) -> Indic
     frame_15m["ema_200"] = talib.EMA(frame_15m["close"], timeperiod=200)
     frame_15m["higher_tf_trend"] = np.where(frame_15m["ema_50"] > frame_15m["ema_200"], 1, -1)
     frame = frame.join(frame_15m[["higher_tf_trend"]], how="left")
-    frame["higher_tf_trend"].ffill(inplace=True)
+    frame["higher_tf_trend"] = frame["higher_tf_trend"].ffill().fillna(0)
 
     signal_columns = [
         "rsi_divergence_signal",
