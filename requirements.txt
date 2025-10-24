@@ -1,0 +1,10 @@
+python-dotenv
+python-binance
+pandas
+numpy
+ta-lib
+tensorflow
+scikit-learn
+stable-baselines3
+gymnasium
+requests
