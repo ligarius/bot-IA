@@ -44,7 +44,8 @@ class TradingEnvironment(gym.Env):
         self.trade_size = trade_size
         self.window_size = CONFIG.rl_window
 
-        obs_dim = self.window_size * normalized.shape[1] + 2
+        extra_dim = 1 + self.lstm_predictions.shape[1]
+        obs_dim = self.window_size * normalized.shape[1] + extra_dim
         self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(obs_dim,), dtype=np.float32)
         self.action_space = spaces.Discrete(3)
         self.reset()
@@ -53,9 +54,13 @@ class TradingEnvironment(gym.Env):
         start = self.current_step - self.window_size
         end = self.current_step
         window = self.normalized[start:end]
-        flattened = window.flatten()
+        flattened = window.flatten().astype(np.float32)
         observation = np.concatenate(
-            [flattened, np.array([self.last_action, self.lstm_predictions[end - 1]])]
+            [
+                flattened,
+                np.array([self.last_action], dtype=np.float32),
+                self.lstm_predictions[end - 1].astype(np.float32),
+            ]
         )
         return observation.astype(np.float32)
 
@@ -66,6 +71,9 @@ class TradingEnvironment(gym.Env):
         self.cash = CONFIG.initial_capital
         self.position = 0.0
         observation = self._get_observation()
+        assert (
+            observation.shape[0] == self.observation_space.shape[0]
+        ), "Observation dimension mismatch"
         return observation, {}
 
     def step(self, action: int):  # type: ignore[override]
@@ -92,6 +100,9 @@ class TradingEnvironment(gym.Env):
         self.current_step += 1
 
         observation = self._get_observation()
+        assert (
+            observation.shape[0] == self.observation_space.shape[0]
+        ), "Observation dimension mismatch"
         return observation, reward, done, False, {}
 
 
