@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .config import CONFIG
+from .features import LSTM_FEATURE_COLUMNS
 from .indicators import compute_indicators
 from .strategy import EnsembleStrategy, StrategyDecision
 from .trader import Trader
@@ -48,11 +49,28 @@ class Backtester:
     ) -> BacktestResult:
         indicators = compute_indicators(frame_5m, frame_15m)
         normalized = indicators.normalized.dropna()
-        signals = indicators.signals.reindex(normalized.index).fillna(0)
-        price_series = frame_5m.set_index("open_time")["close"].loc[normalized.index]
-        if lstm_predictions is not None and len(lstm_predictions) != len(normalized):
-            LOGGER.warning("LSTM predictions length mismatch; ignoring predictions in backtest")
-            lstm_predictions = None
+        feature_frame = indicators.frame[LSTM_FEATURE_COLUMNS].dropna()
+        common_index = normalized.index.intersection(feature_frame.index)
+
+        normalized = normalized.reindex(common_index)
+        signals = indicators.signals.reindex(common_index).fillna(0)
+        price_series = frame_5m.set_index("open_time")["close"].reindex(common_index)
+
+        if lstm_predictions is not None:
+            series_length = len(common_index)
+            if series_length == 0:
+                LOGGER.warning(
+                    "No aligned data available for LSTM predictions; ignoring predictions in backtest"
+                )
+                lstm_predictions = None
+            else:
+                lstm_predictions = np.asarray(lstm_predictions)
+                lstm_predictions = lstm_predictions[-series_length:]
+                if len(lstm_predictions) != series_length:
+                    LOGGER.warning(
+                        "LSTM predictions length mismatch after alignment; ignoring predictions in backtest"
+                    )
+                    lstm_predictions = None
 
         trades: List[TradeRecord] = []
         equity = CONFIG.initial_capital
