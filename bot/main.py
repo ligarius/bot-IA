@@ -53,8 +53,42 @@ class RecalibrationThresholds:
         return issues
 
 
+def _interval_to_minutes(interval: str) -> int:
+    """Convert Binance kline interval strings to minutes."""
+
+    interval = interval.strip()
+    if not interval:
+        raise ValueError("Interval string must not be empty")
+
+    unit_multipliers = {
+        "m": 1,
+        "h": 60,
+        "d": 60 * 24,
+        "w": 60 * 24 * 7,
+    }
+
+    digits = ""
+    unit = ""
+    for char in interval:
+        if char.isdigit():
+            if unit:
+                raise ValueError(f"Invalid interval format: {interval}")
+            digits += char
+        else:
+            unit += char
+
+    if not digits or not unit:
+        raise ValueError(f"Invalid interval format: {interval}")
+
+    if unit not in unit_multipliers:
+        raise ValueError(f"Unsupported interval unit: {unit}")
+
+    return int(digits) * unit_multipliers[unit]
+
+
 def _load_data(loader: MarketDataLoader, interval: str, samples: int) -> pd.DataFrame:
-    lookback_minutes = samples * 5
+    interval_minutes = _interval_to_minutes(interval)
+    lookback_minutes = samples * interval_minutes
     lookback = f"{lookback_minutes} minutes ago UTC"
     return loader.load_klines(CONFIG.symbol, interval, lookback=lookback, min_samples=samples)
 
