@@ -36,13 +36,31 @@ class TradingEnvironment(gym.Env):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, normalized: np.ndarray, rewards: np.ndarray, lstm_predictions: np.ndarray, trade_size: float) -> None:
+    def __init__(
+        self,
+        normalized: np.ndarray,
+        current_prices: np.ndarray,
+        next_prices: np.ndarray,
+        lstm_predictions: np.ndarray,
+        trade_size: float,
+    ) -> None:
         super().__init__()
         self.normalized = normalized
-        self.rewards = rewards
+        self.current_prices = current_prices.astype(np.float32)
+        self.next_prices = next_prices.astype(np.float32)
         self.lstm_predictions = lstm_predictions
         self.trade_size = trade_size
         self.window_size = CONFIG.rl_window
+        self.fee_pct = CONFIG.fee_pct
+        self._unnecessary_trade_penalty = self.trade_size * 0.001
+
+        if not (
+            len(self.normalized)
+            == len(self.current_prices)
+            == len(self.next_prices)
+            == len(self.lstm_predictions)
+        ):
+            raise ValueError("Normalized data and price series must have matching lengths")
 
         extra_dim = 1 + self.lstm_predictions.shape[1]
         obs_dim = self.window_size * normalized.shape[1] + extra_dim
@@ -69,7 +87,8 @@ class TradingEnvironment(gym.Env):
         self.current_step = self.window_size
         self.last_action = 0
         self.cash = CONFIG.initial_capital
-        self.position = 0.0
+        self.position_size = 0.0
+        self.entry_price: float | None = None
         observation = self._get_observation()
         assert (
             observation.shape[0] == self.observation_space.shape[0]
@@ -77,27 +96,42 @@ class TradingEnvironment(gym.Env):
         return observation, {}
 
     def step(self, action: int):  # type: ignore[override]
-        reward = self.rewards[self.current_step]
-        done = self.current_step >= len(self.normalized) - 1
+        if self.current_step >= len(self.current_prices) - 1:
+            observation = self._get_observation()
+            return observation, 0.0, True, False, {}
+
+        current_price = float(self.current_prices[self.current_step])
+        next_price = float(self.next_prices[self.current_step])
+
+        portfolio_value_current = self.cash + self.position_size * current_price
+        penalty = 0.0
 
         if action == 1:  # buy
-            if self.position == 0:
-                self.position = self.trade_size
-                self.cash -= self.trade_size
+            if self.position_size == 0.0:
+                quantity = self.trade_size / current_price
+                cost = self.trade_size
+                fee = cost * self.fee_pct
+                self.cash -= cost + fee
+                self.position_size = quantity
+                self.entry_price = current_price
             else:
-                reward -= 0.1  # penalize unnecessary buy
+                penalty -= self._unnecessary_trade_penalty
         elif action == 2:  # sell
-            if self.position > 0:
-                self.cash += self.trade_size
-                self.position = 0
+            if self.position_size > 0.0:
+                proceeds = self.position_size * current_price
+                fee = proceeds * self.fee_pct
+                self.cash += proceeds - fee
+                self.position_size = 0.0
+                self.entry_price = None
             else:
-                reward -= 0.1
+                penalty -= self._unnecessary_trade_penalty
 
-        portfolio_value = self.cash + self.position
-        reward += portfolio_value * 0.0001
+        portfolio_value_next = self.cash + self.position_size * next_price
+        reward = (portfolio_value_next - portfolio_value_current) + penalty
 
         self.last_action = action
         self.current_step += 1
+        done = self.current_step >= len(self.current_prices) - 1
 
         observation = self._get_observation()
         assert (
