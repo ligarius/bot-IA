@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Mapping
 
 import numpy as np
 import pandas as pd
@@ -46,6 +46,7 @@ class Backtester:
         frame_5m: pd.DataFrame,
         frame_15m: pd.DataFrame,
         lstm_predictions: np.ndarray | None = None,
+        dqn_actions: Mapping[pd.Timestamp, int] | None = None,
     ) -> BacktestResult:
         indicators = compute_indicators(frame_5m, frame_15m)
         normalized = indicators.normalized.dropna()
@@ -87,7 +88,16 @@ class Backtester:
             if lstm_predictions is not None and len(lstm_predictions) == len(normalized):
                 lstm_vector = lstm_predictions[normalized.index.get_loc(idx)]
 
-            decision: StrategyDecision = self.strategy.decide(row, signal_row, lstm_vector)
+            dqn_action = None
+            if dqn_actions is not None:
+                dqn_action = dqn_actions.get(idx)
+
+            decision: StrategyDecision = self.strategy.decide(
+                row,
+                signal_row,
+                lstm_vector,
+                dqn_action=dqn_action,
+            )
 
             if self.trader.position.is_open():
                 exited, pnl_value = self.trader.evaluate_exit(price)
