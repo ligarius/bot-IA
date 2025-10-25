@@ -28,6 +28,10 @@ class EnsembleStrategy:
         score = 0
         reasons = []
 
+        higher_tf_trend = signals.get("higher_tf_trend", 0)
+        proba_buy: float | None = None
+        proba_sell: float | None = None
+
         if signals.get("adx_signal", 0) <= 0:
             return StrategyDecision(action=0, reason="Weak trend (ADX filter)")
 
@@ -52,12 +56,12 @@ class EnsembleStrategy:
             score -= 1
             reasons.append("EMA cross bearish")
 
-        if signals.get("higher_tf_trend", 0) > 0:
-            score += 0.5
-            reasons.append("Higher TF trend bullish")
+        if higher_tf_trend > 0:
+            score += 1
+            reasons.append("Higher TF trend bullish (+1 weight)")
         else:
-            score -= 0.5
-            reasons.append("Higher TF trend bearish")
+            score -= 1.5
+            reasons.append("Higher TF trend bearish (strong penalty)")
 
         if signals.get("bollinger_breakout", 0) > 0:
             score += 0.5
@@ -67,8 +71,8 @@ class EnsembleStrategy:
             reasons.append("Bollinger breakout down")
 
         if lstm_prediction is not None:
-            proba_buy = lstm_prediction[2]
-            proba_sell = lstm_prediction[0]
+            proba_buy = float(lstm_prediction[2])
+            proba_sell = float(lstm_prediction[0])
             if proba_buy - proba_sell > self.threshold:
                 score += 1
                 reasons.append("LSTM predicts upward move")
@@ -76,7 +80,17 @@ class EnsembleStrategy:
                 score -= 1
                 reasons.append("LSTM predicts downward move")
 
-        if score > 1.5:
+        forced_hold = False
+        if higher_tf_trend <= 0 and (proba_buy is None or proba_buy < 0.6):
+            forced_hold = True
+            reasons.append(
+                "Higher TF bearish and LSTM buy confidence below 0.60 -> HOLD"
+            )
+
+        if forced_hold:
+            action = 0
+            reasons.append("Final decision: HOLD (trend guard)")
+        elif score > 1.5:
             action = 1
             reasons.append("Final decision: BUY")
         elif score < -1.5:
