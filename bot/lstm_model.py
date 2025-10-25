@@ -10,6 +10,7 @@ import pandas as pd
 import tensorflow as tf
 from sklearn.metrics import accuracy_score, precision_score, recall_score
 from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
 
 from .config import CONFIG
 
@@ -79,6 +80,13 @@ class LSTMTrainer:
             raise ValueError(f"Unexpected labels encountered: {unique_labels}")
         LOGGER.debug("Unique labels after filtering: %s", sorted(unique_labels))
 
+        label_counts = labels.value_counts()
+        print(label_counts)
+        class_weight_values = compute_class_weight(
+            class_weight="balanced", classes=np.array([0, 1, 2]), y=labels.to_numpy()
+        )
+        class_weight = {cls: weight for cls, weight in zip([0, 1, 2], class_weight_values)}
+
         X, y = self._create_sequences(features, labels, self.config.sequence_length)
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
 
@@ -90,6 +98,7 @@ class LSTMTrainer:
             batch_size=self.config.batch_size,
             validation_split=0.1,
             verbose=0,
+            class_weight=class_weight,
         )
 
         y_pred = model.predict(X_test, verbose=0)
