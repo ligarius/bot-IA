@@ -128,7 +128,10 @@ def train_rl(loader: MarketDataLoader) -> None:
 
     normalized = normalized_df.to_numpy()
     close_series = frame_5m.set_index("open_time")["close"].loc[normalized_df.index]
-    close_prices = close_series.to_numpy()
+    close_prices = close_series.to_numpy(dtype=np.float32)
+    future_prices = np.concatenate([close_prices[1:], close_prices[-1:]]).astype(
+        np.float32
+    )
     lstm_predictions = np.zeros((len(normalized_df), 3))
 
     for idx in range(CONFIG.lstm_sequence_length, len(normalized_df)):
@@ -136,12 +139,10 @@ def train_rl(loader: MarketDataLoader) -> None:
         prediction = trainer.infer(model, window)
         lstm_predictions[idx] = prediction
 
-    price_diff = np.diff(close_prices, prepend=close_prices[0])
-    rewards = price_diff / close_prices
-
     env = TradingEnvironment(
         normalized=normalized,
-        rewards=rewards,
+        current_prices=close_prices,
+        next_prices=future_prices,
         lstm_predictions=lstm_predictions,
         trade_size=CONFIG.trade_size,
     )
