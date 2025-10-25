@@ -5,11 +5,12 @@ import argparse
 import logging
 import sys
 import time
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 
-from .backtester import Backtester
+from .backtester import Backtester, BacktestResult
 from .config import CONFIG, configure_logging
 from .data_loader import MarketDataLoader
 from .features import LSTM_FEATURE_COLUMNS
@@ -20,6 +21,36 @@ from .strategy import EnsembleStrategy
 from .trader import Trader
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class RecalibrationThresholds:
+    """Thresholds to determine when the strategy requires recalibration."""
+
+    min_total_return: float | None = None
+    min_win_rate: float | None = None
+
+    def describe(self) -> str:
+        parts: list[str] = []
+        if self.min_total_return is not None:
+            parts.append(f"min_total_return={self.min_total_return:.4f}")
+        if self.min_win_rate is not None:
+            parts.append(f"min_win_rate={self.min_win_rate:.4f}")
+        return ", ".join(parts) if parts else "no thresholds"
+
+    def unmet_conditions(self, result: BacktestResult) -> list[str]:
+        issues: list[str] = []
+        if self.min_total_return is not None and result.total_return < self.min_total_return:
+            issues.append(
+                "total_return %.2f%% < threshold %.2f%%"
+                % (result.total_return * 100, self.min_total_return * 100)
+            )
+        if self.min_win_rate is not None and result.win_rate < self.min_win_rate:
+            issues.append(
+                "win_rate %.2f%% < threshold %.2f%%"
+                % (result.win_rate * 100, self.min_win_rate * 100)
+            )
+        return issues
 
 
 def _load_data(loader: MarketDataLoader, interval: str, samples: int) -> pd.DataFrame:
@@ -84,7 +115,7 @@ def train_rl(loader: MarketDataLoader) -> None:
     agent.train(env)
 
 
-def run_backtest(loader: MarketDataLoader) -> None:
+def _run_single_backtest(loader: MarketDataLoader) -> BacktestResult:
     frame_5m = _load_data(loader, "5m", CONFIG.data_points_short + 200)
     frame_15m = _load_data(loader, "15m", CONFIG.data_points_long + 200)
     indicators = compute_indicators(frame_5m, frame_15m)
@@ -107,7 +138,11 @@ def run_backtest(loader: MarketDataLoader) -> None:
                 window = feature_df.iloc[idx - CONFIG.lstm_sequence_length : idx]
                 prediction = trainer.infer(model, window)
                 lstm_predictions[idx] = prediction
-            LOGGER.info("Backtest LSTM predictions aligned for %d samples (last timestamp: %s)", len(normalized_df), normalized_df.index[-1])
+            LOGGER.info(
+                "Backtest LSTM predictions aligned for %d samples (last timestamp: %s)",
+                len(normalized_df),
+                normalized_df.index[-1],
+            )
         else:
             lstm_predictions = None
     except FileNotFoundError:
@@ -117,11 +152,94 @@ def run_backtest(loader: MarketDataLoader) -> None:
     strategy = EnsembleStrategy()
     trader = Trader(live=False)
     backtester = Backtester(strategy, trader)
-    result = backtester.run(frame_5m, frame_15m, lstm_predictions)
+    return backtester.run(frame_5m, frame_15m, lstm_predictions)
 
-    LOGGER.info("Backtest completed | PnL: %.2f | Win rate: %.2f%% | Total return: %.2f%%", result.pnl, result.win_rate * 100, result.total_return * 100)
-    for trade in result.trades[-10:]:
-        LOGGER.info("Trade: %s %s @ %.2f | %s", trade.timestamp, trade.action, trade.price, trade.reason)
+
+def recalibrate_strategy(
+    loader: MarketDataLoader,
+    attempt: int,
+    thresholds: RecalibrationThresholds | None,
+) -> None:
+    LOGGER.info(
+        "Recalibration attempt %d starting (%s)",
+        attempt,
+        thresholds.describe() if thresholds else "no thresholds provided",
+    )
+    LOGGER.info("Attempt %d: retraining LSTM model", attempt)
+    train_lstm(loader)
+    LOGGER.info("Attempt %d: retraining reinforcement learning agent", attempt)
+    train_rl(loader)
+
+
+def run_backtest(
+    loader: MarketDataLoader,
+    *,
+    auto_recalibrate: bool = False,
+    thresholds: RecalibrationThresholds | None = None,
+    max_attempts: int = 3,
+) -> None:
+    if auto_recalibrate and thresholds is None:
+        LOGGER.warning(
+            "Auto recalibration requested but no thresholds provided; running a single backtest."
+        )
+        auto_recalibrate = False
+
+    attempt = 1
+    final_result: BacktestResult | None = None
+
+    while True:
+        LOGGER.info("Starting backtest attempt %d", attempt)
+        result = _run_single_backtest(loader)
+        LOGGER.info(
+            "Backtest attempt %d completed | PnL: %.2f | Win rate: %.2f%% | Total return: %.2f%%",
+            attempt,
+            result.pnl,
+            result.win_rate * 100,
+            result.total_return * 100,
+        )
+
+        unmet = thresholds.unmet_conditions(result) if thresholds else []
+        if not auto_recalibrate or not unmet:
+            if thresholds:
+                if unmet:
+                    LOGGER.warning(
+                        "Backtest below thresholds but auto recalibration disabled (%s)",
+                        "; ".join(unmet),
+                    )
+                else:
+                    LOGGER.info("Backtest thresholds satisfied after attempt %d", attempt)
+            final_result = result
+            break
+
+        LOGGER.warning(
+            "Backtest metrics below thresholds on attempt %d: %s",
+            attempt,
+            "; ".join(unmet),
+        )
+
+        if attempt >= max_attempts:
+            LOGGER.warning(
+                "Maximum recalibration attempts (%d) reached without meeting thresholds",
+                max_attempts,
+            )
+            final_result = result
+            break
+
+        recalibrate_strategy(loader, attempt + 1, thresholds)
+        attempt += 1
+        LOGGER.info("Re-running backtest after recalibration attempt %d", attempt)
+
+    if final_result is None:
+        return
+
+    for trade in final_result.trades[-10:]:
+        LOGGER.info(
+            "Trade: %s %s @ %.2f | %s",
+            trade.timestamp,
+            trade.action,
+            trade.price,
+            trade.reason,
+        )
 
 
 def run_paper_trading(loader: MarketDataLoader) -> None:
@@ -235,10 +353,34 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--backtest", action="store_true", help="Run historical backtest")
     parser.add_argument("--paper", action="store_true", help="Run paper trading loop")
     parser.add_argument("--live", action="store_true", help="Run live trading on Binance")
+    parser.add_argument(
+        "--auto-recalibrate",
+        action="store_true",
+        help="Automatically retrain models and rerun the backtest if performance thresholds are not met",
+    )
+    parser.add_argument(
+        "--min-total-return",
+        type=float,
+        default=None,
+        help="Minimum total return (as a decimal, e.g. 0.05 for 5%) required to skip recalibration",
+    )
+    parser.add_argument(
+        "--min-win-rate",
+        type=float,
+        default=None,
+        help="Minimum win rate (0-1 range) required to skip recalibration",
+    )
 
     args = parser.parse_args(argv)
     configure_logging()
     loader = MarketDataLoader()
+
+    thresholds: RecalibrationThresholds | None = None
+    if args.min_total_return is not None or args.min_win_rate is not None:
+        thresholds = RecalibrationThresholds(
+            min_total_return=args.min_total_return,
+            min_win_rate=args.min_win_rate,
+        )
 
     try:
         if args.train_lstm:
@@ -246,12 +388,23 @@ def main(argv: list[str] | None = None) -> int:
         if args.train_rl:
             train_rl(loader)
         if args.backtest:
-            run_backtest(loader)
+            run_backtest(
+                loader,
+                auto_recalibrate=args.auto_recalibrate,
+                thresholds=thresholds,
+            )
         if args.paper:
             run_paper_trading(loader)
         if args.live:
             run_live_trading(loader)
-        if not any(vars(args).values()):
+        actions_selected = [
+            args.train_lstm,
+            args.train_rl,
+            args.backtest,
+            args.paper,
+            args.live,
+        ]
+        if not any(actions_selected):
             parser.print_help()
             return 1
     except Exception as exc:  # pragma: no cover - high-level safeguard
