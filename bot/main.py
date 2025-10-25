@@ -165,6 +165,8 @@ def _run_single_backtest(loader: MarketDataLoader) -> BacktestResult:
     if not feature_df.index.equals(normalized_df.index):
         raise RuntimeError("Feature and normalized data are not aligned for backtesting")
 
+    price_series = frame_5m.set_index("open_time")["close"].loc[common_index]
+
     try:
         model = trainer.load_model()
         if len(normalized_df) > CONFIG.lstm_sequence_length:
@@ -184,10 +186,26 @@ def _run_single_backtest(loader: MarketDataLoader) -> BacktestResult:
         LOGGER.warning("LSTM model not found, proceeding without predictions")
         lstm_predictions = None
 
+    dqn_actions = None
+    try:
+        rl_agent = RLAgent()
+        dqn_model = rl_agent.load()
+        dqn_actions = RLAgent.infer_actions(
+            dqn_model,
+            normalized_df,
+            price_series,
+            lstm_predictions,
+        )
+        LOGGER.info("DQN policy aligned for %d timestamps", len(dqn_actions))
+    except FileNotFoundError:
+        LOGGER.warning("DQN policy not found, proceeding without reinforcement signals")
+    except Exception as exc:
+        LOGGER.exception("Failed to generate DQN actions for backtest: %s", exc)
+
     strategy = EnsembleStrategy()
     trader = Trader(live=False)
     backtester = Backtester(strategy, trader)
-    return backtester.run(frame_5m, frame_15m, lstm_predictions)
+    return backtester.run(frame_5m, frame_15m, lstm_predictions, dqn_actions)
 
 
 def recalibrate_strategy(
@@ -288,6 +306,16 @@ def run_paper_trading(loader: MarketDataLoader) -> None:
         LOGGER.error("Paper trading requires a trained LSTM model: %s", exc)
         return
 
+    try:
+        rl_agent = RLAgent()
+        dqn_model = rl_agent.load()
+        LOGGER.info("Loaded DQN policy for paper trading")
+    except FileNotFoundError:
+        dqn_model = None
+        LOGGER.warning("Paper trading will run without DQN reinforcement due to missing policy")
+
+    dqn_last_action = 0
+
     frame_15m = _load_data(loader, "15m", CONFIG.data_points_long)
 
     while True:
@@ -315,7 +343,22 @@ def run_paper_trading(loader: MarketDataLoader) -> None:
         row = normalized.loc[latest_time]
         price = frame_5m.tail(1)["close"].iloc[0]
 
-        decision = strategy.decide(row, signals, lstm_prediction)
+        dqn_action = None
+        if dqn_model is not None and len(normalized) >= CONFIG.rl_window:
+            window_norm = normalized.tail(CONFIG.rl_window)
+            if len(window_norm) == CONFIG.rl_window:
+                observation = np.concatenate(
+                    [
+                        window_norm.to_numpy(dtype=np.float32).flatten(),
+                        np.array([dqn_last_action], dtype=np.float32),
+                        lstm_prediction.astype(np.float32),
+                    ]
+                )
+                action_value, _ = dqn_model.predict(observation, deterministic=True)
+                dqn_action = int(action_value)
+                dqn_last_action = dqn_action
+
+        decision = strategy.decide(row, signals, lstm_prediction, dqn_action=dqn_action)
         LOGGER.debug("Paper trading alignment check | time=%s | feature_shape=%s | normalized_shape=%s", latest_time, window.shape, normalized.shape)
         LOGGER.info("Decision at %s: %s", latest_time, decision.reason)
 
@@ -335,6 +378,15 @@ def run_live_trading(loader: MarketDataLoader) -> None:
     strategy = EnsembleStrategy()
     trainer = LSTMTrainer()
     model = trainer.load_model()
+    try:
+        rl_agent = RLAgent()
+        dqn_model = rl_agent.load()
+        LOGGER.info("Loaded DQN policy for live trading")
+    except FileNotFoundError:
+        dqn_model = None
+        LOGGER.warning("Live trading will run without DQN reinforcement due to missing policy")
+
+    dqn_last_action = 0
     frame_15m = _load_data(loader, "15m", CONFIG.data_points_long)
 
     while True:
@@ -362,7 +414,22 @@ def run_live_trading(loader: MarketDataLoader) -> None:
         row = normalized.loc[latest_time]
         price = frame_5m.tail(1)["close"].iloc[0]
 
-        decision = strategy.decide(row, signals, lstm_prediction)
+        dqn_action = None
+        if dqn_model is not None and len(normalized) >= CONFIG.rl_window:
+            window_norm = normalized.tail(CONFIG.rl_window)
+            if len(window_norm) == CONFIG.rl_window:
+                observation = np.concatenate(
+                    [
+                        window_norm.to_numpy(dtype=np.float32).flatten(),
+                        np.array([dqn_last_action], dtype=np.float32),
+                        lstm_prediction.astype(np.float32),
+                    ]
+                )
+                action_value, _ = dqn_model.predict(observation, deterministic=True)
+                dqn_action = int(action_value)
+                dqn_last_action = dqn_action
+
+        decision = strategy.decide(row, signals, lstm_prediction, dqn_action=dqn_action)
         LOGGER.debug(
             "Live trading alignment check | time=%s | feature_shape=%s | normalized_shape=%s",
             latest_time,

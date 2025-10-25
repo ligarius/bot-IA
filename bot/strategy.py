@@ -24,6 +24,7 @@ class EnsembleStrategy:
         indicators: pd.Series,
         signals: pd.Series,
         lstm_prediction: np.ndarray | None = None,
+        dqn_action: int | None = None,
     ) -> StrategyDecision:
         score = 0
         reasons = []
@@ -79,6 +80,16 @@ class EnsembleStrategy:
             elif proba_sell - proba_buy > self.threshold:
                 score -= 1
                 reasons.append("LSTM predicts downward move")
+
+        if dqn_action is not None:
+            if dqn_action == 1:
+                score += 1.5
+                reasons.append("DQN policy favors BUY")
+            elif dqn_action == 2:
+                score -= 1.5
+                reasons.append("DQN policy favors SELL")
+            else:
+                reasons.append("DQN policy neutral -> HOLD bias")
 
         forced_hold = False
         if higher_tf_trend <= 0 and (proba_buy is None or proba_buy < 0.6):

@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 import gymnasium as gym
 import numpy as np
+import pandas as pd
 from gymnasium import spaces
 from stable_baselines3 import DQN
 from stable_baselines3.common.callbacks import EvalCallback
@@ -176,3 +177,53 @@ class RLAgent:
         if not model_path.exists():
             raise FileNotFoundError("Trained DQN policy not found. Run with --train-rl first.")
         return DQN.load(model_path)
+
+    @staticmethod
+    def infer_actions(
+        model: DQN,
+        normalized: pd.DataFrame,
+        price_series: pd.Series,
+        lstm_predictions: np.ndarray | None,
+    ) -> Dict[pd.Timestamp, int]:
+        """Generate discrete actions for each timestamp using a trained DQN model."""
+
+        if normalized.empty or price_series.empty:
+            return {}
+
+        timestamps = list(normalized.index)
+        if len(timestamps) <= CONFIG.rl_window:
+            return {}
+
+        normalized_np = normalized.to_numpy(dtype=np.float32)
+        current_prices = price_series.to_numpy(dtype=np.float32)
+        next_prices = np.concatenate([current_prices[1:], current_prices[-1:]], axis=0)
+
+        if lstm_predictions is None or len(lstm_predictions) != len(normalized_np):
+            lstm_inputs = np.zeros((len(normalized_np), 3), dtype=np.float32)
+        else:
+            lstm_inputs = np.asarray(lstm_predictions, dtype=np.float32)
+
+        env = TradingEnvironment(
+            normalized=normalized_np,
+            current_prices=current_prices,
+            next_prices=next_prices,
+            lstm_predictions=lstm_inputs,
+            trade_size=CONFIG.trade_size,
+        )
+
+        observation, _ = env.reset()
+        actions: Dict[pd.Timestamp, int] = {}
+
+        while True:
+            current_idx = env.current_step
+            if current_idx >= len(timestamps):
+                break
+
+            action, _ = model.predict(observation, deterministic=True)
+            actions[timestamps[current_idx]] = int(action)
+
+            observation, _, done, _, _ = env.step(int(action))
+            if done:
+                break
+
+        return actions
