@@ -121,7 +121,12 @@ class LSTMTrainer:
         model_path = CONFIG.model_dir / "lstm_classifier.h5"
         if not model_path.exists():
             raise FileNotFoundError("Trained LSTM model not found. Run with --train-lstm first.")
-        return tf.keras.models.load_model(model_path)
+        model = tf.keras.models.load_model(model_path, compile=False)
+        LOGGER.info(
+            "Loaded LSTM model from %s without compiling; compile manually if further training is required in-session.",
+            model_path,
+        )
+        return model
 
     def infer(self, model: tf.keras.Model, features: pd.DataFrame) -> np.ndarray:
         features = features.dropna().tail(self.config.sequence_length)
