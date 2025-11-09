@@ -53,6 +53,39 @@ class RecalibrationThresholds:
         return issues
 
 
+@dataclass(frozen=True)
+class AttemptParameters:
+    """Training and evaluation parameters for a recalibration attempt."""
+
+    data_points_short: int
+    data_points_long: int
+    rl_timesteps: int
+
+
+DEFAULT_RL_TIMESTEPS = 50_000
+
+
+def _parameters_for_attempt(attempt: int) -> AttemptParameters:
+    """Scale dataset size and RL timesteps as attempts increase."""
+
+    if attempt < 1:
+        raise ValueError("Attempt number must be >= 1")
+
+    growth = max(0, attempt - 1)
+    growth_factor = 1 + 0.5 * growth
+
+    short_samples = int(round(CONFIG.data_points_short * growth_factor))
+    long_samples = int(round(CONFIG.data_points_long * growth_factor))
+
+    rl_timesteps = DEFAULT_RL_TIMESTEPS + growth * 25_000
+
+    return AttemptParameters(
+        data_points_short=max(short_samples, CONFIG.data_points_short),
+        data_points_long=max(long_samples, CONFIG.data_points_long),
+        rl_timesteps=rl_timesteps,
+    )
+
+
 def _interval_to_minutes(interval: str) -> int:
     """Convert Binance kline interval strings to minutes."""
 
@@ -93,9 +126,21 @@ def _load_data(loader: MarketDataLoader, interval: str, samples: int) -> pd.Data
     return loader.load_klines(CONFIG.symbol, interval, lookback=lookback, min_samples=samples)
 
 
-def train_lstm(loader: MarketDataLoader) -> None:
-    frame_5m = _load_data(loader, "5m", max(CONFIG.data_points_short, CONFIG.lstm_sequence_length + 100))
-    frame_15m = _load_data(loader, "15m", CONFIG.data_points_long)
+def train_lstm(
+    loader: MarketDataLoader,
+    *,
+    data_points_short: int | None = None,
+    data_points_long: int | None = None,
+) -> None:
+    short_samples = data_points_short or CONFIG.data_points_short
+    long_samples = data_points_long or CONFIG.data_points_long
+
+    frame_5m = _load_data(
+        loader,
+        "5m",
+        max(short_samples, CONFIG.lstm_sequence_length + 100),
+    )
+    frame_15m = _load_data(loader, "15m", long_samples)
     indicators = compute_indicators(frame_5m, frame_15m)
     features = indicators.frame[LSTM_FEATURE_COLUMNS].dropna()
     trainer = LSTMTrainer()
@@ -103,12 +148,22 @@ def train_lstm(loader: MarketDataLoader) -> None:
     LOGGER.info("LSTM training metrics: %s", metrics)
 
 
-def train_rl(loader: MarketDataLoader) -> None:
+def train_rl(
+    loader: MarketDataLoader,
+    *,
+    data_points_short: int | None = None,
+    data_points_long: int | None = None,
+    timesteps: int | None = None,
+) -> None:
     trainer = LSTMTrainer()
     model = trainer.load_model()
 
-    frame_5m = _load_data(loader, "5m", CONFIG.data_points_short + CONFIG.rl_window + 10)
-    frame_15m = _load_data(loader, "15m", CONFIG.data_points_long)
+    short_samples = data_points_short or CONFIG.data_points_short
+    long_samples = data_points_long or CONFIG.data_points_long
+    rl_timesteps = timesteps or DEFAULT_RL_TIMESTEPS
+
+    frame_5m = _load_data(loader, "5m", short_samples + CONFIG.rl_window + 10)
+    frame_15m = _load_data(loader, "15m", long_samples)
     indicators = compute_indicators(frame_5m, frame_15m)
 
     feature_df = indicators.frame[LSTM_FEATURE_COLUMNS].dropna()
@@ -147,12 +202,20 @@ def train_rl(loader: MarketDataLoader) -> None:
         trade_size=CONFIG.trade_size,
     )
     agent = RLAgent()
-    agent.train(env)
+    agent.train(env, timesteps=rl_timesteps)
 
 
-def _run_single_backtest(loader: MarketDataLoader) -> BacktestResult:
-    frame_5m = _load_data(loader, "5m", CONFIG.data_points_short + 200)
-    frame_15m = _load_data(loader, "15m", CONFIG.data_points_long + 200)
+def _run_single_backtest(
+    loader: MarketDataLoader,
+    *,
+    data_points_short: int | None = None,
+    data_points_long: int | None = None,
+) -> BacktestResult:
+    short_samples = data_points_short or CONFIG.data_points_short
+    long_samples = data_points_long or CONFIG.data_points_long
+
+    frame_5m = _load_data(loader, "5m", short_samples + 200)
+    frame_15m = _load_data(loader, "15m", long_samples + 200)
     indicators = compute_indicators(frame_5m, frame_15m)
 
     trainer = LSTMTrainer()
@@ -212,16 +275,33 @@ def recalibrate_strategy(
     loader: MarketDataLoader,
     attempt: int,
     thresholds: RecalibrationThresholds | None,
+    params: AttemptParameters,
 ) -> None:
     LOGGER.info(
         "Recalibration attempt %d starting (%s)",
         attempt,
         thresholds.describe() if thresholds else "no thresholds provided",
     )
+    LOGGER.info(
+        "Attempt %d parameters: short=%d | long=%d | rl_timesteps=%d",
+        attempt,
+        params.data_points_short,
+        params.data_points_long,
+        params.rl_timesteps,
+    )
     LOGGER.info("Attempt %d: retraining LSTM model", attempt)
-    train_lstm(loader)
+    train_lstm(
+        loader,
+        data_points_short=params.data_points_short,
+        data_points_long=params.data_points_long,
+    )
     LOGGER.info("Attempt %d: retraining reinforcement learning agent", attempt)
-    train_rl(loader)
+    train_rl(
+        loader,
+        data_points_short=params.data_points_short,
+        data_points_long=params.data_points_long,
+        timesteps=params.rl_timesteps,
+    )
 
 
 def run_backtest(
@@ -241,8 +321,13 @@ def run_backtest(
     final_result: BacktestResult | None = None
 
     while True:
+        attempt_params = _parameters_for_attempt(attempt)
         LOGGER.info("Starting backtest attempt %d", attempt)
-        result = _run_single_backtest(loader)
+        result = _run_single_backtest(
+            loader,
+            data_points_short=attempt_params.data_points_short,
+            data_points_long=attempt_params.data_points_long,
+        )
         LOGGER.info(
             "Backtest attempt %d completed | PnL: %.2f | Win rate: %.2f%% | Total return: %.2f%%",
             attempt,
@@ -278,7 +363,9 @@ def run_backtest(
             final_result = result
             break
 
-        recalibrate_strategy(loader, attempt + 1, thresholds)
+        next_attempt = attempt + 1
+        next_params = _parameters_for_attempt(next_attempt)
+        recalibrate_strategy(loader, next_attempt, thresholds, next_params)
         attempt += 1
         LOGGER.info("Re-running backtest after recalibration attempt %d", attempt)
 
